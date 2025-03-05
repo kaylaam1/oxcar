@@ -1,0 +1,88 @@
+
+function [f, f_remin, J] = O2_model_with_remin(par)
+% O2simple_with_remin2: Computes air-sea oxygen fluxes, remineralization, 
+% and the Jacobian matrix for ocean oxygen transport.
+%
+% Inputs:
+%   par - A structure containing grid information, parameters, and transport terms.
+%
+% Outputs:
+%   f       - Air-sea flux term (oxygen flux at the surface).
+%   f_remin - Oxygen consumption due to remineralization at each depth.
+%   J       - Combined flux including transport, gas exchange, and remineralization.
+%
+% Notes:
+% - Remineralization follows a power-law function with depth.
+% - The function assumes remineralization occurs below a reference depth (z_ref).
+% - The Jacobian matrix (J) accounts for oxygen transport, air-sea exchange, and remineralization.
+
+    % Compute air-sea gas exchange parameters (KO2: gas transfer velocity, o2sat: oxygen saturation)
+    [KO2, o2sat] = Fsea2air_v2(par); 
+    
+    % Extract grid information
+    dzt = par.grd.dzt; % Layer thickness at each depth
+    zt = -par.grd.zt;  % Convert depth to negative values (below surface)
+    zw = -par.zw;      % Convert interface depths to negative values
+    iwet = par.iwet;   % Index of wet grid points (ocean cells)
+    
+    % Remineralization parameters
+    z_ref = par.z_ref; % Reference depth where remineralization starts
+    b = par.b;         % Exponent for power-law remineralization
+    A = par.A;         % Scaling constant for remineralization flux
+
+    % Extend zw to include the bottom layer
+    zw(end + 1) = zw(end) - dzt(end); 
+    
+    % Compute remineralization flux (positive upward, meaning loss of oxygen)
+    j_z = -A * (zw / z_ref).^(-b); % Power-law remineralization flux
+
+    % Remove the first value (infinity at zw = 0) and add zero at the bottom
+    j_z(1) = []; 
+    j_z(end + 1) = 0; 
+    
+    % Compute remineralization rate R_z as the convergence of the flux j_z
+    R_z = -((j_z(1:end-1) - j_z(2:end)) ./ dzt); % Discrete derivative
+
+    % Grid size
+    [ny, nx, nz] = size(par.msk); 
+    
+    % Reshape R_z to be a globally constant field
+    R_z = reshape(R_z, [1 1 nz]); 
+    R_z = repmat(R_z, [ny, nx, 1]); 
+
+    % Apply remineralization only below the reference depth
+    i_above_zo = find(zt > z_ref); 
+    R_z(:,:,i_above_zo) = 0; 
+
+    % Compute the Jacobian matrix J including transport, gas exchange, and remineralization
+    J = par.TRdiv + KO2 + d0(R_z(iwet)); 
+
+    % Compute the air-sea oxygen flux (f) as KO2 * oxygen saturation
+    f = KO2 * o2sat; 
+
+    % Oxygen loss due to remineralization
+    f_remin = R_z; 
+end
+
+
+function mse = oxygen_model_optim(params, par, O2_WOA_regrid_mn, iwet)
+    % Unpack parameters
+    b = params(1);
+    A = params(2);
+    z_ref = params(3);
+    
+    % Update par structure
+    par.b = b;
+    par.A = A;
+    par.z_ref = z_ref;
+    
+    % Compute modeled oxygen field
+    [f, ~, J] = O2_model_with_remin(par);
+
+    dO = par.msk + NaN;
+    dO(iwet) = J \ f; % Solve linear system
+    
+    % Compute MSE
+    diff = dO(iwet) - O2_WOA_regrid_mn(iwet);
+    mse = mean(diff.^2, 'omitnan');
+end
