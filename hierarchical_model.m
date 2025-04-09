@@ -469,62 +469,81 @@ sgtitle('Comparison of Observed and Modeled Oxygen Concentrations (mmol/m^3)');
 %% Functions
 
 function [f, Rz, J] = O2simple_with_remin_before_prod(par)
-% O2simple_with_remin2: Computes air-sea oxygen fluxes, remineralization, 
-% production, and the Jacobian matrix for ocean oxygen transport.
+% O2_model_with_remin: The function constructs a system of equations for solving the 
+% steady-state oxygen field in the ocean, including air-sea oxygen fluxes,
+% physical transport, and oxygen consumption due to the respiration of organic matter.
 %
+% Steady-state Oxygen Model Equation:
+% [∇∙(u+K∙∇) + KO2 + Rz] * [dO] = KO2 * O2_sat
+%
+% In Matrix form:
+%     [         J           ]  * [dO] =      f 
+% 
 % Inputs:
-%   par - A structure containing grid information, parameters, and transport terms.
+%   par - A structure containing grid information, the transport matrix, and model parameters (A, b, and z_ref).
+%   The adjustable parameters are:
+%   par.A      - Scaling constant for remineralization flux
+%   par.b      - Exponent for remineralization power-law
+%   par.z_ref  - Reference depth where remineralization starts
 %
 % Outputs:
-%   f       - Air-sea flux term (oxygen flux at the surface).
-%   Rz - Oxygen consumption due to remineralization at each depth.
-%   J       - Combined flux including transport, gas exchange, and remineralization.
+%   f       - Air-sea flux vector (gas transfer velocity * oxygen saturation) (mmol/m^3 s)
+%   J       - Jacobian matrix incorporating transport, air-sea gas exchange, and oxygen consumption (s^-1)
+%   Rz      - Rate coefficient of oxygen utilization due to respiration (s^-1)
 %
 % Notes:
-% - Remineralization follows a power-law function with depth.
-% - The function assumes remineralization occurs below a reference depth (z_ref).
-% - The Jacobian matrix (J) accounts for oxygen transport, air-sea exchange, and remineralization.
+% - The model assumes oxygen utilization follows a first order loss term with the rate coefficient 
+%   given by the derivative of a depth-dependent power-law function below a reference depth (z_ref).
+% - The function constructs a linear system of equations for solving the steady-state oxygen field.
+% - Gas exchange at the surface acts as a boundary condition, restoring oxygen toward equilibrium.
+% - Oxygen Utilization Rates (mmol/m^3 s) can be computed after solving the model by multiplying modeled oxygen (mmol/m^3) 
+%   by Rz, the rate coefficient of oxygen consumption (s^-1).
+% - Oxygen production (Pxy) is assumed to be proportional to oxygen respiration (Rz) integrated from the ocean bottom to z_ref
 
-    % Compute air-sea gas exchange parameters
+    % Compute air-sea gas exchange parameters (KO2: gas transfer velocity, o2sat: oxygen saturation)
     [KO2, o2sat] = Fsea2air_v2(par); 
-    dVt = par.dVt;
+    
     % Extract grid information
+    M3d = par.M3d; % Wet-dry mask
+    msk = par.msk;
     dzt = par.grd.dzt; % Layer thickness at each depth
     zt = -par.grd.zt;  % Convert depth to negative values (below surface)
     zw = -par.zw;      % Convert interface depths to negative values
-    iwet = par.iwet;   % Indices of ocean points (wet cells)
-    spa = 365.25 * 24 * 60^2; % Seconds in a year
-    msk = par.msk;
+    iwet = par.iwet;   % Index of wet grid points (ocean cells)
+    isdry = find(msk(:) == 0); % Index of dry grid points
+
     % Respiration parameters
-    z_ref = par.z_ref; % Reference depth where oxygen consumption starts
-    b = par.b;         % Exponent for power-law 
-    A = par.A;         % Scaling constant
+    % R(z) = (d/dz)(-A * (zw / z_ref).^(-b))  
+    z_ref = par.z_ref; % Reference depth where remineralization starts
+    b = par.b;         % Exponent for power-law remineralization
+    A = par.A;         % Scaling constant for remineralization flux
 
-    % Extend zw to include the bottom layer
+    % Extend zw to include the bottom dry layer
     zw(end + 1) = zw(end) - dzt(end); 
-    
-    % Compute remineralization flux (positive upward, meaning loss of oxygen)
-    j_z = -A * (zw / z_ref).^(-b); % Power-law remineralization flux
 
-    % Remove the first value (infinity at zw = 0) and add zero at the bottom
-    j_z(1) = []; 
-    j_z(end + 1) = 0; 
-    
-    % Compute remineralization rate R_z as the convergence of the flux j_z
-    Rz = -((j_z(1:end-1) - j_z(2:end)) ./ dzt); % Discrete derivative
+    % Compute j_z, the power law representing organic carbon flux divided by an assumed O2:C ratio 
+    % (negative because downward carbon flux)
+    j_z = -A * (zw / z_ref).^(-b); 
+    j_z(1) = [];  % Remove the first value (infinity at zw = 0) 
+    j_z(end + 1) = 0; % Add zero at the bottom because the assumption is the flux that hits the sediments is respired in the deepest grid cell of the model
 
-    % Reshape R_z to be a globally constant field
-    % Grid size
-    [ny, nx, nz] = size(msk); 
-    Rz = reshape(Rz, [1 1 nz]); 
-    Rz = repmat(Rz, [ny, nx, 1]); 
-
-    % Apply remineralization only below the reference depth
-    i_above_zo = find(zt > z_ref); 
-    Rz(:,:,i_above_zo) = 0; 
-    isdry = find(msk(:) == 0); 
+    [ny, nx, nz] = size(par.msk); % Grid size
+    % Copy flux profile horizontally and apply ocean mask
+    j_z = reshape(j_z, [1 1 nz+1]);  
+    j_z = repmat(j_z, [ny, nx, 1]); 
+    M3d_bottom = M3d;
+    M3d_bottom(:,:,end+1) = M3d(:,:,end);
+    dzt = reshape(dzt, [1 1 nz]);
+    dzt = repmat(dzt, [ny, nx, 1]);
+    j_z(M3d_bottom == 0) = 0;
+      
+    % The respiration rate coefficient, Rz, is assumed to be proportional to the carbon 
+    % remineralization rate & oxygen availability
+    Rz = -((j_z(:,:,1:end-1) - j_z(:,:,2:end)) ./ dzt); % Take derivative of j_z to get the carbon flux divergence (representing respiration)
+    i_above_zo = find(zt > z_ref); % index for depths shallower than z_ref
+    Rz(:,:,i_above_zo) = 0; % Apply respiration only below the z_ref
     Rz(isdry) = 0;
- 
+
     % Compute the Jacobian matrix J including transport, gas exchange,
     % respiration
      J = par.TRdiv + KO2 + d0(Rz(iwet));
